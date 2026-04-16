@@ -1,0 +1,96 @@
+{
+  "CLAUDE_CODE_VERSION": {
+    "desc": "Pin a specific Claude Code release (empty = use local binary at ~/.local/bin/claude).",
+    "examples": "2.1.96, 2.1.110, (empty)"
+  },
+  "CLAUDE_CODE_MODEL": {
+    "desc": "Model to launch with. Plain 'opus'/'sonnet' DISABLES the 1M-token context; add [1m] to enable it.",
+    "examples": "opus, opus[1m], sonnet, sonnet[1m], haiku, (empty = harness default)"
+  },
+  "CLAUDE_CODE_DISABLE_1M_CONTEXT": {
+    "desc": "Force-disable the 1M-token context window regardless of model (1 = disable, 0 = enable).",
+    "examples": "0, 1"
+  },
+  "CLAUDE_CODE_MAX_OUTPUT_TOKENS": {
+    "desc": "Maximum output tokens per assistant turn.",
+    "examples": "4096, 16384, 32768, 64000"
+  },
+  "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": {
+    "desc": "Autocompact trigger as a percentage of the context window.",
+    "examples": "50, 80, 92"
+  },
+  "CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING": {
+    "desc": "Disable adaptive thinking (1 = disable, 0 = enable).",
+    "examples": "0, 1"
+  },
+  "CLAUDE_CODE_DISABLE_AUTO_MEMORY": {
+    "desc": "Disable automatic memory loading (1 = disable, 0 = enable).",
+    "examples": "0, 1"
+  },
+  "CLAUDE_CODE_SUBAGENT_MODEL": {
+    "desc": "Default model used by subagents spawned via the Task tool.",
+    "examples": "haiku, sonnet, opus"
+  },
+  "ENABLE_TOOL_SEARCH": {
+    "desc": "Enable deferred tool loading via ToolSearch (1 = on, 0 = off).",
+    "examples": "0, 1"
+  },
+  "IS_SANDBOX": {
+    "desc": "Advertise that Claude is running in a sandboxed environment.",
+    "examples": "0, 1"
+  },
+  "USER_TYPE": {
+    "desc": "User-type marker consumed by internal tooling.",
+    "examples": "ant, external"
+  },
+  "CLAUDE_CODE_NO_FLICKER": {
+    "desc": "Disable terminal redraw flicker on slow renders (1 = disable flicker, 0 = default).",
+    "examples": "0, 1"
+  },
+  "CLAUDE_CODE_RATE_LIMIT_ENABLED": {
+    "desc": "Toggle client-side rate limiting (1 = enable, 0 = disable).",
+    "examples": "0, 1"
+  },
+  "CLAUDE_CODE_CACHE_TTL_MS": {
+    "desc": "Prompt-cache TTL in milliseconds. 86400000 = 24h.",
+    "examples": "300000 (5m), 3600000 (1h), 86400000 (24h)"
+  },
+  "CLAUDE_CODE_MODEL_PERF": {
+    "desc": "Model performance tier hint.",
+    "examples": "predictable, fast, default"
+  },
+  "CLAUDE_CODE_MIN_TPS": {
+    "desc": "Minimum acceptable tokens-per-second before the client escalates or warns.",
+    "examples": "100, 200, 300"
+  },
+  "CLAUDE_CODE_NO_NERF": {
+    "desc": "Disable model nerfs / capability dampening (1 = disable nerfs, 0 = default).",
+    "examples": "0, 1"
+  },
+  "CLAUDE_CODE_EFFORT_LEVEL": {
+    "desc": "Reasoning depth per turn. 'max' forces full reasoning every turn. Overrides the settings.json effortLevel field (which caps at 'high'). Note: the 'ultrathink' prompt trigger maps to 'high', so with max set it is a downgrade.",
+    "examples": "low, medium, high, max"
+  },
+  "MAX_THINKING_TOKENS": {
+    "desc": "Upper bound on internal reasoning ('scratch pad') tokens per turn. 31999 is the documented maximum. With CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING=1 this becomes the fixed budget rather than a ceiling.",
+    "examples": "10000, 20000, 31999"
+  },
+  "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": {
+    "desc": "Disable telemetry, error reporting, feature-flag polling, and other background network calls. May suppress some server-gated experimental features.",
+    "examples": "0, 1"
+  },
+  "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": {
+    "desc": "Enable experimental multi-agent coordination tools (TeamCreate, TaskCreate/Update/List, SendMessage). WARNING: ~7x token cost when agent teams are actively used.",
+    "examples": "0, 1"
+  },
+  "DANGEROUSLY_SKIP_PERMISSIONS": {
+    "desc": "Pass --dangerously-skip-permissions to claude (1=yes, 0=no).",
+    "examples": "0, 1",
+    "kind": "internal"
+  },
+  "DEFAULT_PROMPT": {
+    "desc": "Prompt sent as the first message if none passed on CLI. Empty string = send no prompt.",
+    "examples": "go, continue, (empty)",
+    "kind": "internal"
+  }
+}

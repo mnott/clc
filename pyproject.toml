@@ -1,0 +1,17 @@
+[project]
+name = "dev-clc"
+version = "0.1.0"
+description = "Claude Code startup manager — layered env-var config"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "typer>=0.15.0",
+    "rich>=13.7.1",
+]
+
+# Note: clc has no .py extension. uv warns that [project.scripts] requires
+# tool.uv.package = true or a build-system to actually install entry points.
+# The script works via ./clc directly (shebang) or via a symlink on PATH —
+# no installed entry point is needed for normal use.
+[project.scripts]
+clc = "clc:app"

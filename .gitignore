@@ -1,0 +1,39 @@
+.DS_Store
+
+# Python
+__pycache__/
+.Python
+build/
+
+# Virtual environments
+.env
+.venv/
+env/
+venv/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Claude Code — track bundled skills; ignore everything else
+.claude/*
+!.claude/skills/
+!.claude/skills/**
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# Logs
+*.log
+
+# Local Notes
+Notes/
+memory/

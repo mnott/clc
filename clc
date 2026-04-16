@@ -1,0 +1,1003 @@
+#!/usr/bin/env -S env -u VIRTUAL_ENV uv run python
+"""
+Claude Code has an env-var problem. Every project needs different model settings,
+version pins, and token limits — but there's no clean way to manage that across
+projects without manually editing JSON files every time you switch contexts. clc fixes this.
+
+Install clc and you get a three-layer config system that merges a shared user baseline,
+project-level overrides, and runtime CLI flags into a single resolved launch command.
+Switch projects and your settings follow. Pin a version for one repo without touching
+another. Set haiku as the subagent model globally and override it locally for the one
+project that needs opus. Everything composable, nothing magic.
+
+## Quick Start
+
+Tell Claude Code:
+
+> Clone https://github.com/mnott/clc and set it up for me
+
+That's it. Claude clones the repo, reads this README, and runs `./clc install` for you.
+
+### Or do it manually
+
+```bash
+git clone https://github.com/mnott/clc.git dev.clc
+cd dev.clc
+./clc install
+```
+
+`clc install` runs `uv sync` and symlinks the script into `~/.local/bin/` (falling back
+to `/usr/local/bin/` with sudo only if `~/.local/bin` isn't on PATH).
+
+Requires `uv` on PATH (`brew install uv` on macOS). Python itself is managed by uv —
+no separate install needed.
+
+To remove: `clc uninstall` (or tell Claude "uninstall clc" from inside the repo).
+
+### Verify
+
+```bash
+clc config show        # see effective values across all layers
+clc --dry-run          # preview the full launch command without running it
+clc                    # launch Claude Code with your current config
+```
+
+---
+
+## Why Three Layers
+
+Managing Claude Code parameters by editing `~/.claude/settings.json` by hand works
+until you have five projects with different needs. Then it becomes a source of
+breakage — you forget which setting you changed for which project, or a global
+change clobbers a local override you didn't remember you'd made.
+
+clc makes the layering explicit:
+
+| Layer  | File                                  | Purpose                          |
+|--------|---------------------------------------|----------------------------------|
+| user   | `~/.claude/settings.json` (env block) | Shared baseline across projects  |
+| global | `<clc dir>/mysettings.json`           | clc-provided opinionated defaults |
+| local  | `./.claude/mysettings.json`           | Per-project overrides (highest)  |
+| CLI    | flags passed to `clc` / `clc run`     | Runtime-only, never persisted    |
+
+Later layers override earlier ones. CLI flags beat everything and are never written
+to disk. The local layer is the most specific — it wins because it knows the most
+about the current project.
+
+`clc config show` shows you every managed parameter, where the effective value comes
+from, and what the other layers have set. No guessing.
+
+---
+
+## Quickstart Examples
+
+Pin a specific Claude Code version for this session only:
+
+```bash
+clc --version 2.1.96
+```
+
+Preview the full launch command without running it:
+
+```bash
+clc run -v 2.1.96 --dry-run
+```
+
+Persist a version pin for this project only:
+
+```bash
+clc config set CLAUDE_CODE_VERSION 2.1.96 --local
+```
+
+Use sonnet with the 1M-token context window:
+
+```bash
+clc --model sonnet[1m]
+```
+
+Use haiku for subagents to save costs, globally:
+
+```bash
+clc config set CLAUDE_CODE_SUBAGENT_MODEL haiku --user
+```
+
+Override it to opus for a specific high-stakes project:
+
+```bash
+clc config set CLAUDE_CODE_SUBAGENT_MODEL opus --local
+```
+
+Disable the 1M context window for a project that doesn't need it:
+
+```bash
+clc config set CLAUDE_CODE_DISABLE_1M_CONTEXT 1 --local
+```
+
+---
+
+## Managed Parameters
+
+clc tracks {{PARAMS_COUNT}} parameters, defined in `params.json` next to the script.
+Use `clc config show` to see effective values across all layers, or
+`clc config show -v` for descriptions and examples. Edit `params.json` to add
+or retire parameters — no code changes required.
+
+{{PARAMS_TABLE}}
+
+---
+
+## Common Recipes
+
+Show every managed parameter with its effective source:
+
+```bash
+clc config show
+clc config show -v    # include descriptions and examples
+```
+
+Set autocompact to trigger at 80% context:
+
+```bash
+clc config set CLAUDE_AUTOCOMPACT_PCT_OVERRIDE 80 --user
+```
+
+Reset all managed keys in user settings.json back to clc's global defaults:
+
+```bash
+clc config reset
+```
+
+Initialize a per-project local config from global defaults:
+
+```bash
+clc setup
+```
+
+Regenerate this README:
+
+```bash
+clc doc > README.md
+```
+
+---
+
+## CLI Reference
+
+```
+clc [OPTIONS]               Launch Claude Code with effective config.
+clc run [OPTIONS] [PROMPT]  Explicit launch subcommand; same options as above.
+
+Options shared by clc and clc run:
+  -v, --version VERSION     Pin a Claude Code release via npx.
+  -m, --model MODEL         Model to launch (overrides config, not persisted).
+  -e, --effort LEVEL        Effort level: low | medium | high | max.
+  -t, --max-tokens TOKENS   Max output tokens (shorthand: 4k, 16k, 32k, 64k).
+  -s, --subagent SUBAGENT   Subagent model: haiku | sonnet | opus.
+  -n, --dry-run             Print the command that would run, then exit.
+      --skip-perms / --no-skip-perms  Toggle --dangerously-skip-permissions.
+
+clc config show [-v] [-x]   Show all managed parameters and their values.
+clc config set KEY VALUE [--local | --user | --global]
+                            Set a parameter in the chosen layer.
+clc config unset KEY [--local | --user | --global]
+                            Remove a parameter from the chosen layer.
+clc config reset [-y]       Reset user settings.json to clc global defaults.
+
+clc setup [--force]         Create ./.claude/mysettings.json from global defaults.
+clc install [-f]            Run uv sync and symlink clc into ~/.local/bin/ (or /usr/local/bin/).
+clc uninstall [-f]          Remove symlink(s) created by clc install.
+clc doc                     Print this README as markdown (clc doc > README.md).
+```
+"""
+
+import ast
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from typing import Optional
+
+import typer
+from rich.console import Console
+from rich.table import Table
+from rich import print as rprint
+
+app = typer.Typer(
+    name="clc",
+    help=(
+        "Claude Code startup manager.\n\n"
+        "Run with no subcommand to launch claude with the current effective config.\n"
+        "Env vars are layered: user settings.json < global mysettings.json < local mysettings.json < CLI flags.\n\n"
+        "Examples:\n"
+        "  clc                       # launch with current config\n"
+        "  clc -v 2.1.96             # pin version for this run only\n"
+        "  clc -m opus               # disable 1M-token context for this run\n"
+        "  clc --dry-run             # preview the command that would run\n"
+        "  clc config show           # list every managed parameter + effective value\n"
+        "  clc config set CLAUDE_CODE_MODEL opus --local   # persist to this project\n"
+    ),
+    no_args_is_help=False,
+    invoke_without_command=True,
+    pretty_exceptions_enable=False,
+)
+config_app = typer.Typer(
+    help=(
+        "Manage persistent config across three layers.\n\n"
+        "Precedence (later overrides earlier): user < global < local. CLI flags beat all.\n"
+        "  user   → ~/.claude/settings.json  (env block)\n"
+        "  global → <clc script dir>/mysettings.json\n"
+        "  local  → ./.claude/mysettings.json\n"
+    )
+)
+app.add_typer(config_app, name="config")
+
+console = Console()
+
+
+@app.callback(invoke_without_command=True)
+def main(
+    ctx: typer.Context,
+    dry_run: bool = typer.Option(False, "--dry-run", "-n", help="Print the command and env that would be executed, then exit."),
+    effort: Optional[str] = typer.Option(None, "--effort", "-e", metavar="LEVEL", help="Effort level: low | medium | high | max. Defaults to the level in your .zshrc claude alias."),
+    max_tokens: Optional[str] = typer.Option(None, "--max-tokens", "-t", metavar="TOKENS", help="Max output tokens. Accepts shorthand (4k, 16k, 32k, 64k) or an exact integer."),
+    model: Optional[str] = typer.Option(None, "--model", "-m", metavar="MODEL", help="Model to launch. Plain 'opus'/'sonnet' DISABLES the 1M-token context; add [1m] to enable it. Examples: opus, opus[1m], sonnet, haiku."),
+    skip_permissions: Optional[bool] = typer.Option(None, "--skip-perms/--no-skip-perms", help="Pass --dangerously-skip-permissions to claude. Default comes from your .zshrc alias."),
+    subagent: Optional[str] = typer.Option(None, "--subagent", "-s", metavar="SUBAGENT", help="Override CLAUDE_CODE_SUBAGENT_MODEL for this run: haiku | sonnet | opus."),
+    version: Optional[str] = typer.Option(None, "--version", "-v", metavar="VERSION", help="Pin a Claude Code release via npx (e.g. 2.1.96). Empty = use local binary at ~/.local/bin/claude."),
+):
+    """Launch claude when no subcommand is supplied. All options are runtime-only (not persisted)."""
+    if ctx.invoked_subcommand is None:
+        _run_claude(
+            effort=effort,
+            max_tokens=_parse_tokens(max_tokens) if max_tokens else None,
+            model=model,
+            skip_permissions=skip_permissions,
+            subagent=subagent,
+            version=version,
+            dry_run=dry_run,
+        )
+
+# ── paths ──────────────────────────────────────────────────────────────────
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
+GLOBAL_MYSETTINGS_PATH = SCRIPT_DIR / "mysettings.json"
+LOCAL_MYSETTINGS_PATH = Path.cwd() / ".claude" / "mysettings.json"
+PARAMS_PATH = SCRIPT_DIR / "params.json"
+
+# ── parameter registry ─────────────────────────────────────────────────────
+# The registry lives in params.json next to this script so descriptions and
+# example values can be edited without touching code. Add a new parameter by
+# appending an entry to params.json — no Python change required.
+
+def _read_json_dict(path: Path) -> dict:
+    """Return the JSON object at `path`, or `{}` for missing/empty files.
+
+    Only raises on real syntax errors in non-empty content. Missing or
+    whitespace-only files are treated as "no overrides" rather than fatal.
+    """
+    if not path.exists():
+        return {}
+    text = path.read_text().strip()
+    if not text:
+        return {}
+    return json.loads(text)
+
+
+def _load_params() -> dict[str, dict[str, str]]:
+    return _read_json_dict(PARAMS_PATH)
+
+PARAMS: dict[str, dict[str, str]] = _load_params()
+
+# ── defaults ───────────────────────────────────────────────────────────────
+
+def _load_defaults() -> dict[str, str]:
+    """Load global mysettings.json verbatim. Used only by `config reset`."""
+    return _read_json_dict(GLOBAL_MYSETTINGS_PATH)
+
+DEFAULTS: dict[str, str] = _load_defaults()
+
+# ── helpers ────────────────────────────────────────────────────────────────
+
+def _load_settings() -> dict:
+    return _read_json_dict(SETTINGS_PATH)
+
+
+def _save_settings(data: dict) -> None:
+    SETTINGS_PATH.write_text(json.dumps(data, indent=2) + "\n")
+
+
+def _get_env_block(data: dict) -> dict:
+    return data.setdefault("env", {})
+
+
+def _parse_tokens(value: str) -> int:
+    """Parse token shorthand: 4k→4096, 16k→16384, 32k→32768, 64k→65536, or exact int."""
+    value = value.lower().strip()
+    if value.endswith("k"):
+        return int(value[:-1]) * 1024
+    return int(value)
+
+
+def _current_alias_version() -> str:
+    """Parse the version from .zshrc claude alias, best-effort."""
+    zshrc = Path.home() / ".zshrc"
+    if not zshrc.exists():
+        return "unknown"
+    for line in zshrc.read_text().splitlines():
+        if "npx @anthropic-ai/claude-code@" in line and "alias claude=" in line:
+            # e.g. alias claude='npx @anthropic-ai/claude-code@2.1.96 ...'
+            part = line.split("@anthropic-ai/claude-code@")[1]
+            version = part.split()[0].rstrip("'\"")
+            return version
+    return "unknown"
+
+
+def _current_alias_flags() -> dict:
+    """Parse skip-perms and effort from .zshrc claude alias, best-effort.
+
+    Returns sentinels meaning "not present in the alias":
+        skip_permissions: None  (no opinion — let caller decide)
+        effort:           None  (no opinion — caller should not append --effort)
+    """
+    result: dict = {"skip_permissions": None, "effort": None}
+    zshrc = Path.home() / ".zshrc"
+    if not zshrc.exists():
+        return result
+    for line in zshrc.read_text().splitlines():
+        if "alias claude=" in line and "claude-code" in line:
+            result["skip_permissions"] = "--dangerously-skip-permissions" in line
+            if "--effort" in line:
+                parts = line.split("--effort")
+                effort_part = parts[1].strip().split()[0].rstrip("'\"")
+                result["effort"] = effort_part
+    return result
+
+
+def _current_zshrc_env() -> dict:
+    """Parse IS_SANDBOX and USER_TYPE from .zshrc exports."""
+    zshrc = Path.home() / ".zshrc"
+    result = {"IS_SANDBOX": "unknown", "USER_TYPE": "unknown"}
+    if not zshrc.exists():
+        return result
+    for line in zshrc.read_text().splitlines():
+        line = line.strip()
+        if line.startswith("export IS_SANDBOX="):
+            result["IS_SANDBOX"] = line.split("=", 1)[1]
+        elif line.startswith("export USER_TYPE="):
+            result["USER_TYPE"] = line.split("=", 1)[1]
+    return result
+
+
+# ── config helpers ────────────────────────────────────────────────────────
+
+def _load_local_mysettings() -> dict[str, str]:
+    """Load local ./.claude/mysettings.json if it exists."""
+    return _read_json_dict(LOCAL_MYSETTINGS_PATH)
+
+
+def _save_local_mysettings(data: dict) -> None:
+    """Save to local ./.claude/mysettings.json (creates dir if needed)."""
+    LOCAL_MYSETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    LOCAL_MYSETTINGS_PATH.write_text(json.dumps(data, indent=2) + "\n")
+
+
+def _load_global_mysettings() -> dict[str, str]:
+    """Load global mysettings.json."""
+    return _read_json_dict(GLOBAL_MYSETTINGS_PATH)
+
+
+def _save_global_mysettings(data: dict) -> None:
+    """Save to global mysettings.json."""
+    GLOBAL_MYSETTINGS_PATH.write_text(json.dumps(data, indent=2) + "\n")
+
+
+def _effective_config() -> dict[str, tuple[str, str]]:
+    """Resolve every PARAMS key against all three layers.
+
+    Precedence (later overrides earlier):
+        user settings.json  <  global mysettings.json  <  local mysettings.json
+
+    Returns a dict mapping key -> (value, source). A key absent from every
+    layer is omitted. A key set to "" in some layer is kept (with that source);
+    callers that treat empty as "skip env var" still do so via their own check,
+    but empty is preserved here so explicit-empty overrides are visible.
+    """
+    user = _get_env_block(_load_settings())
+    glob = _load_global_mysettings()
+    local = _load_local_mysettings()
+
+    merged: dict[str, tuple[str, str]] = {}
+    for key in PARAMS:
+        if key in user:
+            merged[key] = (user[key], "user")
+        if key in glob:
+            merged[key] = (glob[key], "global")
+        if key in local:
+            merged[key] = (local[key], "local")
+    return merged
+
+
+# ── config subcommands ─────────────────────────────────────────────────────
+
+@config_app.command("show")
+def config_show(
+    extras: bool = typer.Option(False, "--extras", "-x", help="Also list non-managed env keys found in user settings.json."),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Print per-parameter descriptions and example values below the table."),
+):
+    """Show every managed parameter across all layers with description and effective source.
+
+    Unconfigured parameters are still listed so you can see which knobs exist
+    (e.g. set CLAUDE_CODE_MODEL=opus to disable the 1M-token context window).
+    """
+    global_defaults = _load_global_mysettings()
+    local_settings = _load_local_mysettings()
+    user_settings = _get_env_block(_load_settings())
+    effective = _effective_config()
+
+    console.print("[bold]Config layers[/bold] [dim](later overrides earlier; CLI flags beat all)[/dim]:")
+    console.print(f"  1. [yellow]user[/yellow]     {SETTINGS_PATH}  [dim](env block)[/dim]")
+    console.print(f"  2. [dim]global[/dim]   {GLOBAL_MYSETTINGS_PATH}  [dim](clc defaults)[/dim]")
+    local_status = "[green](exists)[/green]" if LOCAL_MYSETTINGS_PATH.exists() else "[dim](not found — create with `clc setup`)[/dim]"
+    console.print(f"  3. [cyan]local[/cyan]    {LOCAL_MYSETTINGS_PATH}  {local_status}")
+    console.print()
+
+    table = Table(title="clc managed parameters (values per layer)", show_header=True, header_style="bold")
+    table.add_column("Key", style="bold", no_wrap=True)
+    table.add_column("user", style="yellow")
+    table.add_column("global", style="dim")
+    table.add_column("local", style="cyan")
+    table.add_column("effective", style="bold green")
+    table.add_column("src", style="dim", no_wrap=True)
+
+    unset_marker = "[dim](unset)[/dim]"
+    for key in sorted(PARAMS):
+        u = user_settings.get(key, "")
+        g = global_defaults.get(key, "")
+        l = local_settings.get(key, "")
+        if key in effective:
+            eff_val, src = effective[key]
+        else:
+            eff_val, src = "", "-"
+        table.add_row(
+            key,
+            u if u != "" else "-",
+            g if g != "" else "-",
+            l if l != "" else "-",
+            eff_val if eff_val else unset_marker,
+            src,
+        )
+
+    console.print(table)
+
+    if verbose:
+        console.print()
+        console.print("[bold]Descriptions[/bold]:")
+        for key, meta in sorted(PARAMS.items()):
+            console.print(f"  [bold]{key}[/bold]")
+            console.print(f"    {meta['desc']}")
+            console.print(f"    [dim]examples:[/dim] {meta['examples']}")
+
+    if extras:
+        managed = set(PARAMS.keys())
+        extra_keys = sorted(k for k in user_settings if k not in managed)
+        if extra_keys:
+            console.print()
+            xt = Table(title="Other keys in user settings.json (not managed by clc)", show_header=True, header_style="dim")
+            xt.add_column("Key", style="bold")
+            xt.add_column("Value", style="yellow")
+            for k in extra_keys:
+                xt.add_row(k, str(user_settings[k]))
+            console.print(xt)
+
+    console.print()
+    console.print("[dim]Precedence: CLI flags > local > global > user.  Use `clc config set KEY VALUE --local|--user|--global`.[/dim]")
+
+
+@config_app.command("set")
+def config_set(
+    key: str = typer.Argument(..., help="Env var key (e.g. CLAUDE_CODE_MODEL). See `clc config show` for the list."),
+    value: str = typer.Argument(..., help="Value to set. Use an empty string to clear (e.g. ''). For examples per key, see `clc config show`."),
+    local: bool = typer.Option(False, "--local", "-l", help="Write to ./.claude/mysettings.json (per-project, highest precedence among persisted layers)."),
+    user: bool = typer.Option(False, "--user", "-u", help="Write to ~/.claude/settings.json env block (baseline)."),
+    glob: bool = typer.Option(False, "--global", "-g", help="Write to the clc-provided mysettings.json next to the script."),
+):
+    """Persist a config value in one of the three layers.
+
+    Default target: --local if ./.claude/mysettings.json already exists, otherwise --user.
+    Override with one of --local / --user / --global (mutually exclusive).
+    """
+    # Determine target
+    if sum([local, user, glob]) > 1:
+        rprint("[red]Specify only one of --local, --user, --global[/red]")
+        raise typer.Exit(1)
+
+    if glob:
+        data = _load_global_mysettings()
+        old = data.get(key, "")
+        data[key] = value
+        _save_global_mysettings(data)
+        target = "global"
+    elif user:
+        settings = _load_settings()
+        env = _get_env_block(settings)
+        old = env.get(key, "")
+        env[key] = value
+        _save_settings(settings)
+        target = "user"
+    elif local or LOCAL_MYSETTINGS_PATH.exists():
+        data = _load_local_mysettings()
+        old = data.get(key, "")
+        data[key] = value
+        _save_local_mysettings(data)
+        target = "local"
+    else:
+        # Default to user settings.json
+        settings = _load_settings()
+        env = _get_env_block(settings)
+        old = env.get(key, "")
+        env[key] = value
+        _save_settings(settings)
+        target = "user"
+
+    rprint(f"[green]Set[/green] {key} in [cyan]{target}[/cyan]: [dim]{old or '-'}[/dim] -> [bold]{value}[/bold]")
+
+
+@config_app.command("unset")
+def config_unset(
+    key: str = typer.Argument(..., help="Env var key to remove from the selected layer."),
+    local: bool = typer.Option(False, "--local", "-l", help="Remove from ./.claude/mysettings.json."),
+    user: bool = typer.Option(False, "--user", "-u", help="Remove from ~/.claude/settings.json env block."),
+    glob: bool = typer.Option(False, "--global", "-g", help="Remove from the clc-provided mysettings.json."),
+):
+    """Remove a key from a single layer.
+
+    Default target: --local if ./.claude/mysettings.json exists, otherwise --user.
+    Removing from one layer lets a lower layer (or harness default) take effect again.
+    """
+    if sum([local, user, glob]) > 1:
+        rprint("[red]Specify only one of --local, --user, --global[/red]")
+        raise typer.Exit(1)
+
+    if glob:
+        data = _load_global_mysettings()
+        if key not in data:
+            rprint(f"[yellow]{key}[/yellow] not in global mysettings.json")
+            raise typer.Exit(0)
+        del data[key]
+        _save_global_mysettings(data)
+        target = "global"
+    elif user:
+        settings = _load_settings()
+        env = _get_env_block(settings)
+        if key not in env:
+            rprint(f"[yellow]{key}[/yellow] not in user settings.json")
+            raise typer.Exit(0)
+        del env[key]
+        _save_settings(settings)
+        target = "user"
+    elif local or LOCAL_MYSETTINGS_PATH.exists():
+        data = _load_local_mysettings()
+        if key not in data:
+            rprint(f"[yellow]{key}[/yellow] not in local mysettings.json")
+            raise typer.Exit(0)
+        del data[key]
+        _save_local_mysettings(data)
+        target = "local"
+    else:
+        settings = _load_settings()
+        env = _get_env_block(settings)
+        if key not in env:
+            rprint(f"[yellow]{key}[/yellow] not in user settings.json")
+            raise typer.Exit(0)
+        del env[key]
+        _save_settings(settings)
+        target = "user"
+
+    rprint(f"[green]Removed[/green] {key} from [cyan]{target}[/cyan]")
+
+
+@config_app.command("reset")
+def config_reset(
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt."),
+):
+    """Reset managed keys in ~/.claude/settings.json to the clc-provided global defaults.
+
+    Only the user layer is touched — global and local mysettings.json are left alone.
+    """
+    if not yes:
+        typer.confirm("Reset managed env keys in user settings.json to clc global defaults?", abort=True)
+    data = _load_settings()
+    env = _get_env_block(data)
+    for key, val in DEFAULTS.items():
+        env[key] = val
+    _save_settings(data)
+    rprint("[green]Reset managed keys in user settings.json to clc global defaults.[/green]")
+
+
+# ── setup command ─────────────────────────────────────────────────────────
+
+@app.command()
+def setup(
+    force: bool = typer.Option(False, "--force", "-f", help="Overwrite ./.claude/mysettings.json if it already exists."),
+):
+    """Create ./.claude/mysettings.json seeded with the clc global defaults.
+
+    Use this to start a project-level override file; edit it afterwards or use
+    `clc config set KEY VALUE --local` to update individual keys.
+    """
+    target_dir = Path.cwd() / ".claude"
+    target_file = target_dir / "mysettings.json"
+
+    if target_file.exists() and not force:
+        rprint(f"[yellow]{target_file} already exists.[/yellow] Use --force to overwrite.")
+        raise typer.Exit(1)
+
+    # Create .claude dir if needed
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    # Copy global mysettings.json
+    if not GLOBAL_MYSETTINGS_PATH.exists():
+        rprint(f"[red]Global mysettings.json not found at {GLOBAL_MYSETTINGS_PATH}[/red]")
+        raise typer.Exit(1)
+
+    global_defaults = _read_json_dict(GLOBAL_MYSETTINGS_PATH)
+    target_file.write_text(json.dumps(global_defaults, indent=2) + "\n")
+
+    rprint(f"[green]Created[/green] {target_file}")
+    rprint("[dim]Edit this file to customize settings for this project.[/dim]")
+
+
+# ── install / uninstall commands ─────────────────────────────────────────
+
+@app.command()
+def install(
+    force: bool = typer.Option(False, "--force", "-f", help="Overwrite an existing symlink without prompting."),
+):
+    """Run uv sync and symlink clc into ~/.local/bin/ (or /usr/local/bin/ with sudo).
+
+    From a fresh clone this is all you need — uv manages the virtualenv automatically
+    via the script's shebang. Requires uv on PATH (brew install uv on macOS).
+    """
+    if not shutil.which("uv"):
+        rprint("[red]uv not found on PATH.[/red]  Install it first:  brew install uv")
+        raise typer.Exit(1)
+
+    if not shutil.which("npx"):
+        rprint("[yellow]Warning:[/yellow] npx not found on PATH (or resolves to a dead symlink).")
+        rprint("[dim]clc's default CLAUDE_CODE_VERSION pins a release via npx, so you'll need Node.js:[/dim]")
+        rprint("[dim]  macOS:          brew install node[/dim]")
+        rprint("[dim]  Debian/Ubuntu:  curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo -E bash - && sudo apt install -y nodejs[/dim]")
+        rprint("[dim]Or run with a local claude binary instead:  clc config unset CLAUDE_CODE_VERSION --global[/dim]")
+
+    rprint(f"[dim]Running uv sync in {SCRIPT_DIR}...[/dim]")
+    subprocess.run(["uv", "sync"], cwd=SCRIPT_DIR, check=True)
+
+    script = SCRIPT_DIR / "clc"
+    local_bin = Path.home() / ".local" / "bin"
+    usr_local_bin = Path("/usr/local/bin")
+
+    path_dirs = [Path(p) for p in os.environ.get("PATH", "").split(":") if p]
+
+    if local_bin in path_dirs or not path_dirs:
+        target = local_bin / "clc"
+        use_sudo = False
+    elif usr_local_bin in path_dirs:
+        rprint(f"[yellow]~/.local/bin is not on PATH but /usr/local/bin is.[/yellow]")
+        if sys.stdin.isatty() and typer.confirm(f"Install to {usr_local_bin}/clc (requires sudo)?", default=False):
+            target = usr_local_bin / "clc"
+            use_sudo = True
+        else:
+            target = local_bin / "clc"
+            use_sudo = False
+            rprint(f"[dim]Using {local_bin} anyway. Add it to PATH:[/dim]  export PATH=\"$HOME/.local/bin:$PATH\"")
+    else:
+        target = local_bin / "clc"
+        use_sudo = False
+        rprint(f"[dim]~/.local/bin is not on PATH. After install, add it:[/dim]  export PATH=\"$HOME/.local/bin:$PATH\"")
+
+    if not use_sudo:
+        target.parent.mkdir(parents=True, exist_ok=True)
+
+    if target.exists() or target.is_symlink():
+        if target.is_symlink():
+            current = target.resolve()
+            # Idempotent: if it already points at the same script, do nothing.
+            if not force and current == script.resolve():
+                rprint(f"[green]Already installed[/green]  {target}  ->  {current}")
+                rprint("[dim]Nothing to do. Use --force to reinstall anyway.[/dim]")
+                return
+            rprint(f"[yellow]{target}[/yellow] already exists → [dim]{current}[/dim]")
+            if not force:
+                if not sys.stdin.isatty():
+                    rprint("[red]Non-interactive; refusing to overwrite an existing symlink.[/red]")
+                    rprint("[dim]Re-run with --force to replace it:  ./clc install --force[/dim]")
+                    raise typer.Exit(1)
+                if not typer.confirm("Replace it?", default=True):
+                    raise typer.Exit(0)
+        else:
+            if not force:
+                rprint(f"[red]{target} exists and is not a symlink.[/red] Use --force to overwrite.")
+                raise typer.Exit(1)
+        if use_sudo:
+            subprocess.run(["sudo", "rm", "-f", str(target)], check=True)
+        else:
+            target.unlink()
+
+    if use_sudo:
+        subprocess.run(["sudo", "ln", "-sfn", str(script), str(target)], check=True)
+    else:
+        target.symlink_to(script)
+
+    result = subprocess.run([str(target), "--help"], capture_output=True)
+    ok = result.returncode == 0
+
+    uv_version = subprocess.run(["uv", "--version"], capture_output=True, text=True).stdout.strip()
+    rprint()
+    rprint(f"[green]Installed[/green]  {script}  ->  {target}")
+    rprint(f"  uv: {uv_version}")
+    rprint(f"  verify: {'[green]ok[/green]' if ok else '[red]FAILED (--help returned nonzero)[/red]'}")
+    if not ok:
+        raise typer.Exit(1)
+
+
+@app.command()
+def uninstall(
+    force: bool = typer.Option(False, "--force", "-f", help="Remove without prompting."),
+):
+    """Remove symlink(s) created by clc install.
+
+    Checks both ~/.local/bin/clc and /usr/local/bin/clc. Only removes symlinks
+    that point into this repo. The .venv/ directory is never touched.
+    """
+    candidates = [
+        Path.home() / ".local" / "bin" / "clc",
+        Path("/usr/local/bin/clc"),
+    ]
+    removed_any = False
+
+    for target in candidates:
+        if not target.exists() and not target.is_symlink():
+            continue
+
+        if not target.is_symlink():
+            rprint(f"[yellow]{target}[/yellow] exists but is not a symlink — skipping.")
+            continue
+
+        resolved = target.resolve()
+        points_here = str(resolved).startswith(str(SCRIPT_DIR))
+        use_sudo = str(target).startswith("/usr/local")
+
+        if points_here:
+            if not force and sys.stdin.isatty():
+                if not typer.confirm(f"Remove {target} -> {resolved}?", default=True):
+                    continue
+            # non-tty: default=True → proceed without prompting
+        else:
+            rprint(f"[yellow]{target}[/yellow] points to [dim]{resolved}[/dim] (outside this repo).")
+            if not force:
+                if not sys.stdin.isatty():
+                    rprint(f"[dim]Non-interactive; skipping. Use --force to remove.[/dim]")
+                    continue
+                if not typer.confirm(f"Remove it anyway?", default=False):
+                    continue
+
+        if use_sudo:
+            subprocess.run(["sudo", "rm", "-f", str(target)], check=True)
+        else:
+            target.unlink()
+        rprint(f"[green]Removed[/green] {target}")
+        removed_any = True
+
+    if not removed_any:
+        rprint("[dim]Nothing to remove.[/dim]")
+
+    venv = SCRIPT_DIR / ".venv"
+    if venv.exists():
+        rprint(f"[dim].venv at {venv} was left in place. Remove manually if desired.[/dim]")
+
+
+# ── run logic ─────────────────────────────────────────────────────────────
+
+def _run_claude(
+    effort: Optional[str] = None,
+    model: Optional[str] = None,
+    skip_permissions: Optional[bool] = None,
+    subagent: Optional[str] = None,
+    max_tokens: Optional[int] = None,
+    sandbox: Optional[int] = None,
+    user_type: Optional[str] = None,
+    version: Optional[str] = None,
+    dry_run: bool = False,
+    prompt: Optional[str] = None,
+):
+    """Core logic to launch Claude Code."""
+
+    # ── Resolve effective config (user < global < local) ──────────────────
+    effective = _effective_config()
+
+    # ── Resolve version: CLI > effective config > empty (use local binary) ──
+    if version is None:
+        version = effective.get("CLAUDE_CODE_VERSION", ("", ""))[0]
+
+    # ── Resolve model: CLI > effective config > empty (harness default) ──
+    if model is None:
+        model = effective.get("CLAUDE_CODE_MODEL", ("", ""))[0]
+
+    # ── Resolve skip_permissions: CLI > config > alias > False ──────────
+    if skip_permissions is None:
+        cfg_val = effective.get("DANGEROUSLY_SKIP_PERMISSIONS", ("", ""))[0]
+        if cfg_val != "":
+            skip_permissions = cfg_val == "1"
+
+    # ── Resolve effort: CLI > config > alias > None (don't append flag) ─
+    if effort is None:
+        cfg_effort = effective.get("CLAUDE_CODE_EFFORT_LEVEL", ("", ""))[0]
+        if cfg_effort != "":
+            effort = cfg_effort
+
+    alias_flags = _current_alias_flags()
+    if skip_permissions is None and alias_flags["skip_permissions"] is not None:
+        skip_permissions = alias_flags["skip_permissions"]
+    if effort is None and alias_flags["effort"] is not None:
+        effort = alias_flags["effort"]
+
+    if skip_permissions is None:
+        skip_permissions = False  # default off when nothing says otherwise
+
+    # ── Validate effort only if one was actually requested ───────────────
+    if effort:
+        valid_efforts = {"low", "medium", "high", "max"}
+        if effort not in valid_efforts:
+            typer.echo(f"Invalid effort '{effort}'. Choose from: {', '.join(sorted(valid_efforts))}", err=True)
+            raise typer.Exit(1)
+
+    # ── Build env overrides from effective config, then CLI flags ─────────
+    env_overrides: dict[str, str] = {}
+    for key, (val, _src) in effective.items():
+        if key in ("CLAUDE_CODE_VERSION", "CLAUDE_CODE_MODEL"):
+            continue  # surfaced on the command line, not as env
+        if PARAMS.get(key, {}).get("kind") == "internal":
+            continue  # clc-internal params must not leak into the subprocess env
+        if val != "":
+            env_overrides[key] = val
+
+    # Override with CLI flags
+    if sandbox is not None:
+        env_overrides["IS_SANDBOX"] = str(sandbox)
+    if user_type is not None:
+        env_overrides["USER_TYPE"] = user_type
+    if subagent is not None:
+        valid_models = {"haiku", "sonnet", "opus"}
+        if subagent not in valid_models:
+            typer.echo(f"Invalid subagent '{subagent}'. Choose from: {', '.join(sorted(valid_models))}", err=True)
+            raise typer.Exit(1)
+        env_overrides["CLAUDE_CODE_SUBAGENT_MODEL"] = subagent
+    if max_tokens is not None:
+        env_overrides["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = str(max_tokens)
+
+    # ── Build command ─────────────────────────────────────────────────────
+    if version:
+        # Specific version via npx
+        cmd = ["npx", f"@anthropic-ai/claude-code@{version}"]
+        version_display = version
+    else:
+        # Local binary
+        cmd = [str(Path.home() / ".local" / "bin" / "claude")]
+        version_display = "local"
+
+    if skip_permissions:
+        cmd.append("--dangerously-skip-permissions")
+
+    if model:
+        cmd.extend(["--model", model])
+
+    if effort:
+        cmd.extend(["--effort", effort])
+
+    # ── Resolve default prompt: CLI arg > config, else send nothing ──────
+    # The prompt is config-only: whatever DEFAULT_PROMPT resolves to is sent
+    # verbatim. Absent from every layer (or explicit "") = no prompt argument.
+    # The shipped global mysettings.json sets DEFAULT_PROMPT="go"; emptying or
+    # removing it from every layer launches claude with no auto-prompt.
+    if prompt is None:
+        prompt = effective.get("DEFAULT_PROMPT", ("", ""))[0]
+    if prompt:
+        cmd.append(prompt)
+
+    # ── Merge env: process env + overrides (overrides win) ───────────────
+    final_env = os.environ.copy()
+    final_env.update(env_overrides)
+
+    # ── Dry run: show the full resolved launch and exit ──────────────────
+    # On a real launch we stay silent so claude's own UI takes over cleanly.
+    if dry_run:
+        model_display = model if model else "default"
+        effort_display = effort if effort else "default"
+        console.print(f"[bold cyan]clc[/bold cyan]")
+        console.print(f"  [dim]version:[/dim] [bold]{version_display}[/bold]  [dim]model:[/dim] [bold]{model_display}[/bold]  [dim]effort:[/dim] [bold]{effort_display}[/bold]  [dim]skip-perms:[/dim] [bold]{skip_permissions}[/bold]")
+        console.print(f"  [dim]env:[/dim]")
+        for k, v in sorted(env_overrides.items()):
+            console.print(f"    {k}=[bold]{v}[/bold]")
+        cmd_str = " ".join(cmd)
+        console.print(f"  [dim]$[/dim] {cmd_str}")
+        console.print("[yellow]Dry run — not executing.[/yellow]")
+        return
+
+    # ── Preflight: verify the command exists (clean error beats a traceback) ─
+    if not shutil.which(cmd[0]):
+        if cmd[0] == "npx":
+            rprint(f"[red]npx not found on PATH[/red] (or resolves to a dead symlink — e.g. stale /snap/bin/npx).")
+            rprint("[dim]A pinned CLAUDE_CODE_VERSION requires Node.js.  Install it:[/dim]")
+            rprint("[dim]  macOS:          brew install node[/dim]")
+            rprint("[dim]  Debian/Ubuntu:  curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo -E bash - && sudo apt install -y nodejs[/dim]")
+            rprint("[dim]  Or skip it:     clc config unset CLAUDE_CODE_VERSION --global[/dim]")
+        else:
+            rprint(f"[red]Command not found:[/red] {cmd[0]}")
+            if cmd[0].endswith("/claude"):
+                rprint("[dim]No local claude binary. Either install one at that path, or pin a version:[/dim]")
+                rprint("[dim]  clc config set CLAUDE_CODE_VERSION 2.1.105 --global[/dim]")
+        raise typer.Exit(127)
+
+    # ── Execute ───────────────────────────────────────────────────────────
+    os.execvpe(cmd[0], cmd, final_env)
+
+
+# ── doc command ───────────────────────────────────────────────────────────
+
+def _render_params_table() -> str:
+    rows = ["| Parameter | What it controls | Examples |",
+            "|-----------|-----------------|---------|"]
+    for key, meta in sorted(PARAMS.items()):
+        desc = meta.get("desc", "").replace("|", r"\|")
+        examples = meta.get("examples", "").replace("|", r"\|")
+        rows.append(f"| `{key}` | {desc} | {examples} |")
+    return "\n".join(rows)
+
+
+@app.command()
+def doc():
+    """Print the module docstring as markdown (use: `clc doc > README.md`)."""
+    src = Path(__file__).read_text()
+    module_doc = (ast.get_docstring(ast.parse(src)) or "").strip()
+    module_doc = module_doc.replace("{{PARAMS_COUNT}}", str(len(PARAMS)))
+    module_doc = module_doc.replace("{{PARAMS_TABLE}}", _render_params_table())
+    print(f"# clc\n\n{module_doc}")
+
+
+# ── run command (explicit) ────────────────────────────────────────────────
+
+@app.command()
+def run(
+    effort: Optional[str] = typer.Option(None, "--effort", "-e", metavar="LEVEL", help="Effort level: low | medium | high | max."),
+    max_tokens: Optional[str] = typer.Option(None, "--max-tokens", "-t", metavar="TOKENS", help="Max output tokens. Shorthand (4k, 16k, 32k, 64k) or an exact integer."),
+    model: Optional[str] = typer.Option(None, "--model", "-m", metavar="MODEL", help="Model to launch. Plain 'opus'/'sonnet' DISABLES 1M context; add [1m] to enable it."),
+    skip_permissions: Optional[bool] = typer.Option(None, "--skip-perms/--no-skip-perms", help="Toggle --dangerously-skip-permissions."),
+    subagent: Optional[str] = typer.Option(None, "--subagent", "-s", metavar="SUBAGENT", help="Subagent model: haiku | sonnet | opus."),
+    sandbox: Optional[int] = typer.Option(None, "--sandbox", metavar="0|1", help="Set IS_SANDBOX env var (1 = sandbox, 0 = not)."),
+    user_type: Optional[str] = typer.Option(None, "--user-type", metavar="TYPE", help="Set USER_TYPE env var."),
+    version: Optional[str] = typer.Option(None, "--version", "-v", metavar="VERSION", help="Pin a Claude Code release via npx (e.g. 2.1.96). Empty = local binary."),
+    dry_run: bool = typer.Option(False, "--dry-run", "-n", help="Print the command and env that would be executed, then exit."),
+    prompt: Optional[str] = typer.Argument(None, help="Prompt to send as the first message. Defaults to 'go' (which the session hook routes to TODO.md)."),
+):
+    """Launch Claude Code with optional overrides. Overrides are runtime-only; persist with `clc config set`."""
+    _run_claude(
+        effort=effort,
+        max_tokens=_parse_tokens(max_tokens) if max_tokens else None,
+        model=model,
+        skip_permissions=skip_permissions,
+        subagent=subagent,
+        sandbox=sandbox,
+        user_type=user_type,
+        version=version,
+        dry_run=dry_run,
+        prompt=prompt,
+    )
+
+
+# ── entrypoint ─────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    app()
