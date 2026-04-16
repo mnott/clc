@@ -240,10 +240,10 @@ console = Console()
 def main(
     ctx: typer.Context,
     dry_run: bool = typer.Option(False, "--dry-run", "-n", help="Print the command and env that would be executed, then exit."),
-    effort: Optional[str] = typer.Option(None, "--effort", "-e", metavar="LEVEL", help="Effort level: low | medium | high | max. Defaults to the level in your .zshrc claude alias."),
+    effort: Optional[str] = typer.Option(None, "--effort", "-e", metavar="LEVEL", help="Effort level: low | medium | high | max. No default — omit to leave unset."),
     max_tokens: Optional[str] = typer.Option(None, "--max-tokens", "-t", metavar="TOKENS", help="Max output tokens. Accepts shorthand (4k, 16k, 32k, 64k) or an exact integer."),
     model: Optional[str] = typer.Option(None, "--model", "-m", metavar="MODEL", help="Model to launch. Plain 'opus'/'sonnet' DISABLES the 1M-token context; add [1m] to enable it. Examples: opus, opus[1m], sonnet, haiku."),
-    skip_permissions: Optional[bool] = typer.Option(None, "--skip-perms/--no-skip-perms", help="Pass --dangerously-skip-permissions to claude. Default comes from your .zshrc alias."),
+    skip_permissions: Optional[bool] = typer.Option(None, "--skip-perms/--no-skip-perms", help="Pass --dangerously-skip-permissions to claude. Default is off unless DANGEROUSLY_SKIP_PERMISSIONS is set in config."),
     subagent: Optional[str] = typer.Option(None, "--subagent", "-s", metavar="SUBAGENT", help="Override CLAUDE_CODE_SUBAGENT_MODEL for this run: haiku | sonnet | opus."),
     version: Optional[str] = typer.Option(None, "--version", "-v", metavar="VERSION", help="Pin a Claude Code release via npx (e.g. 2.1.96). Empty = use local binary at ~/.local/bin/claude."),
 ):
@@ -319,56 +319,6 @@ def _parse_tokens(value: str) -> int:
     if value.endswith("k"):
         return int(value[:-1]) * 1024
     return int(value)
-
-
-def _current_alias_version() -> str:
-    """Parse the version from .zshrc claude alias, best-effort."""
-    zshrc = Path.home() / ".zshrc"
-    if not zshrc.exists():
-        return "unknown"
-    for line in zshrc.read_text().splitlines():
-        if "npx @anthropic-ai/claude-code@" in line and "alias claude=" in line:
-            # e.g. alias claude='npx @anthropic-ai/claude-code@2.1.96 ...'
-            part = line.split("@anthropic-ai/claude-code@")[1]
-            version = part.split()[0].rstrip("'\"")
-            return version
-    return "unknown"
-
-
-def _current_alias_flags() -> dict:
-    """Parse skip-perms and effort from .zshrc claude alias, best-effort.
-
-    Returns sentinels meaning "not present in the alias":
-        skip_permissions: None  (no opinion — let caller decide)
-        effort:           None  (no opinion — caller should not append --effort)
-    """
-    result: dict = {"skip_permissions": None, "effort": None}
-    zshrc = Path.home() / ".zshrc"
-    if not zshrc.exists():
-        return result
-    for line in zshrc.read_text().splitlines():
-        if "alias claude=" in line and "claude-code" in line:
-            result["skip_permissions"] = "--dangerously-skip-permissions" in line
-            if "--effort" in line:
-                parts = line.split("--effort")
-                effort_part = parts[1].strip().split()[0].rstrip("'\"")
-                result["effort"] = effort_part
-    return result
-
-
-def _current_zshrc_env() -> dict:
-    """Parse IS_SANDBOX and USER_TYPE from .zshrc exports."""
-    zshrc = Path.home() / ".zshrc"
-    result = {"IS_SANDBOX": "unknown", "USER_TYPE": "unknown"}
-    if not zshrc.exists():
-        return result
-    for line in zshrc.read_text().splitlines():
-        line = line.strip()
-        if line.startswith("export IS_SANDBOX="):
-            result["IS_SANDBOX"] = line.split("=", 1)[1]
-        elif line.startswith("export USER_TYPE="):
-            result["USER_TYPE"] = line.split("=", 1)[1]
-    return result
 
 
 # ── config helpers ────────────────────────────────────────────────────────
@@ -826,26 +776,19 @@ def _run_claude(
     if model is None:
         model = effective.get("CLAUDE_CODE_MODEL", ("", ""))[0]
 
-    # ── Resolve skip_permissions: CLI > config > alias > False ──────────
+    # ── Resolve skip_permissions: CLI > config > False ──────────────────
     if skip_permissions is None:
         cfg_val = effective.get("DANGEROUSLY_SKIP_PERMISSIONS", ("", ""))[0]
         if cfg_val != "":
             skip_permissions = cfg_val == "1"
+        else:
+            skip_permissions = False
 
-    # ── Resolve effort: CLI > config > alias > None (don't append flag) ─
+    # ── Resolve effort: CLI > config > None (don't append flag) ─────────
     if effort is None:
         cfg_effort = effective.get("CLAUDE_CODE_EFFORT_LEVEL", ("", ""))[0]
         if cfg_effort != "":
             effort = cfg_effort
-
-    alias_flags = _current_alias_flags()
-    if skip_permissions is None and alias_flags["skip_permissions"] is not None:
-        skip_permissions = alias_flags["skip_permissions"]
-    if effort is None and alias_flags["effort"] is not None:
-        effort = alias_flags["effort"]
-
-    if skip_permissions is None:
-        skip_permissions = False  # default off when nothing says otherwise
 
     # ── Validate effort only if one was actually requested ───────────────
     if effort:
