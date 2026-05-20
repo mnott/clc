@@ -173,6 +173,7 @@ Options shared by clc and clc run:
   -e, --effort LEVEL        Effort level: low | medium | high | max.
   -t, --max-tokens TOKENS   Max output tokens (shorthand: 4k, 16k, 32k, 64k).
   -s, --subagent SUBAGENT   Subagent model: haiku | sonnet | opus.
+  -r, --resume SESSION_ID   Resume a prior session (passed to claude as --resume).
   -n, --dry-run             Print the command that would run, then exit.
       --skip-perms / --no-skip-perms  Toggle --dangerously-skip-permissions.
 
@@ -182,6 +183,41 @@ clc config set KEY VALUE [--local | --user | --global]
 clc config unset KEY [--local | --user | --global]
                             Remove a parameter from the chosen layer.
 clc config reset [-y]       Reset user settings.json to clc global defaults.
+
+clc sessions list [-a] [-w]
+                            List registered sessions (sorted by most recent).
+                            -w/--with-latest: also show latest UUID derived from history.jsonl.
+clc sessions cd NAME        Print the session's directory.
+                            With `eval "$(clc shell-init)"` loaded, this actually cd's your shell.
+clc sessions resume NAME [-L] [-A] [-u]
+                            Chdir to session dir and launch claude --resume <uuid>.
+                            -L/--latest: auto-pick latest local transcript if stored UUID is stale.
+                            -A/--auto: ignore stored UUID; use latest from ~/.claude/history.jsonl.
+                            -u/--update: persist a freshly chosen UUID back to the registry.
+clc sessions latest [NAME|DIR] [-a] [-T N]
+                            Print the latest real session UUID (scans history.jsonl).
+                            -a: show top 10 candidates; -T: prompts threshold (default 2).
+                            Composable: `clc -r $(clc sessions latest NAME)`.
+clc sessions scan [NAME|DIR] [-n N]
+                            List all transcript jsonl files in ~/.claude/projects/<encoded>/
+                            (and its sessions/ subdir), sorted by mtime — the doc'd workaround.
+clc sessions start NAME [--no-rename] [--no-save]
+                            Launch a FRESH claude session in NAME's directory, with
+                            `/name "NAME"` prepended so the new session inherits the saved name.
+                            On exit, registry is updated with the new UUID from history.jsonl.
+clc sessions save [NAME] [UUID] [-d DESKTOP]
+                            Add or update a session for the current directory.
+                            UUID auto-resolves from $CLAUDE_SESSION_ID or claude transcripts.
+clc sessions find QUERY [--save]
+                            Search ~/.claude/history.jsonl for a prompt; surface
+                            candidate session UUIDs from claude transcripts.
+clc sessions rm NAME [-y]   Remove a session from the registry.
+
+clc shell-init              Print a shell wrapper so `clc sessions cd` actually cd's
+                            your shell. Add to ~/.zshrc:  eval "$(clc shell-init)"
+
+Registry file: $CLC_SESSIONS_FILE or ~/.claude/session.json (override with --file/-f).
+The -r/--resume flag on `clc` and `clc run` accepts a saved session name OR a raw UUID.
 
 clc setup [--force]         Create ./.claude/mysettings.json from global defaults.
 clc install [-f]            Run uv sync and symlink clc into ~/.local/bin/ (or /usr/local/bin/).
@@ -193,9 +229,11 @@ clc doc                     Print this README as markdown (clc doc > README.md).
 import ast
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -246,10 +284,11 @@ def main(
     skip_permissions: Optional[bool] = typer.Option(None, "--skip-perms/--no-skip-perms", help="Pass --dangerously-skip-permissions to claude. Default is off unless DANGEROUSLY_SKIP_PERMISSIONS is set in config."),
     subagent: Optional[str] = typer.Option(None, "--subagent", "-s", metavar="SUBAGENT", help="Override CLAUDE_CODE_SUBAGENT_MODEL for this run: haiku | sonnet | opus."),
     version: Optional[str] = typer.Option(None, "--version", "-v", metavar="VERSION", help="Pin a Claude Code release via npx (e.g. 2.1.96). Empty = use local binary at ~/.local/bin/claude."),
+    resume: Optional[str] = typer.Option(None, "--resume", "-r", metavar="SESSION_ID", help="Resume a prior session by id (passed to claude as --resume)."),
 ):
     """Launch claude when no subcommand is supplied. All options are runtime-only (not persisted)."""
     if ctx.invoked_subcommand is None:
-        _run_claude(
+        code = _run_claude(
             effort=effort,
             max_tokens=_parse_tokens(max_tokens) if max_tokens else None,
             model=model,
@@ -257,7 +296,10 @@ def main(
             subagent=subagent,
             version=version,
             dry_run=dry_run,
+            resume=resume,
         )
+        if code:
+            raise typer.Exit(code)
 
 # ── paths ──────────────────────────────────────────────────────────────────
 
@@ -762,8 +804,10 @@ def _run_claude(
     version: Optional[str] = None,
     dry_run: bool = False,
     prompt: Optional[str] = None,
-):
-    """Core logic to launch Claude Code."""
+    resume: Optional[str] = None,
+    name_to_apply: Optional[str] = None,
+) -> int:
+    """Core logic to launch Claude Code. Returns the exit code (no internal sys.exit)."""
 
     # ── Resolve effective config (user < global < local) ──────────────────
     effective = _effective_config()
@@ -840,6 +884,28 @@ def _run_claude(
     if effort:
         cmd.extend(["--effort", effort])
 
+    # Prepend the `/Name <name>` slash command (the Name skill) so a fresh
+    # session adopts the saved name automatically.
+    _prompt_prefix = ""
+    if name_to_apply:
+        _prompt_prefix = f"/Name {name_to_apply}\n"
+
+    if resume:
+        # Allow a saved-session name (or list #) in place of a raw UUID.
+        # UUIDs are 36 chars with 4 dashes; anything else → look up in registry.
+        uuid_re = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+        if not uuid_re.match(resume):
+            try:
+                reg = _load_sessions_registry(_sessions_file())
+                hit = _resolve_session(reg, resume)
+                if hit:
+                    uid = _entry_uuid(hit[1])
+                    if uid:
+                        resume = uid
+            except Exception:
+                pass
+        cmd.extend(["--resume", resume])
+
     # ── Resolve default prompt: CLI arg > config, else send nothing ──────
     # The prompt is config-only: whatever DEFAULT_PROMPT resolves to is sent
     # verbatim. Absent from every layer (or explicit "") = no prompt argument.
@@ -847,8 +913,9 @@ def _run_claude(
     # removing it from every layer launches claude with no auto-prompt.
     if prompt is None:
         prompt = effective.get("DEFAULT_PROMPT", ("", ""))[0]
-    if prompt:
-        cmd.append(prompt)
+    combined_prompt = (_prompt_prefix + (prompt or "")).strip("\n")
+    if combined_prompt:
+        cmd.append(combined_prompt)
 
     # ── Merge env: process env + overrides (overrides win) ───────────────
     final_env = os.environ.copy()
@@ -867,7 +934,7 @@ def _run_claude(
         cmd_str = " ".join(cmd)
         console.print(f"  [dim]$[/dim] {cmd_str}")
         console.print("[yellow]Dry run — not executing.[/yellow]")
-        return
+        return 0
 
     # ── Preflight: verify the command exists (clean error beats a traceback) ─
     if not shutil.which(cmd[0]):
@@ -885,7 +952,53 @@ def _run_claude(
         raise typer.Exit(127)
 
     # ── Execute ───────────────────────────────────────────────────────────
-    os.execvpe(cmd[0], cmd, final_env)
+    # subprocess.run (not execvpe) so we can clean up the terminal after claude
+    # exits — otherwise iTerm2 DA2 query replies (^[P>|iTerm2…) leak into the
+    # next prompt when claude exits via an early error path without restoring
+    # the TTY.
+    try:
+        result = subprocess.run(cmd, env=final_env)
+    except KeyboardInterrupt:
+        _cleanup_terminal()
+        return 130
+    _cleanup_terminal()
+    return result.returncode
+
+
+def _cleanup_terminal() -> None:
+    """Restore the TTY and drain any pending terminal responses after claude exits.
+
+    Claude's early-exit paths (e.g. `--resume` rejection) don't always reset the
+    terminal mode, leaving DA1/DA2 query responses queued in stdin which then
+    bleed into the next shell prompt. This combines:
+      1. A short sleep so any in-flight terminal responses can arrive.
+      2. An active read-drain on stdin (handles bytes that arrive after exec ends).
+      3. termios flush (discards anything still queued at the kernel TTY layer).
+      4. Writing terminal-reset escape sequences to undo alt-screen / bracketed paste / focus events.
+    """
+    if not sys.stdin.isatty():
+        return
+    try:
+        import select
+        import termios
+        import time
+        time.sleep(0.05)
+        fd = sys.stdin.fileno()
+        # Drain any input bytes already in the OS pipe buffer.
+        while select.select([fd], [], [], 0)[0]:
+            try:
+                if not os.read(fd, 4096):
+                    break
+            except OSError:
+                break
+        termios.tcflush(fd, termios.TCIFLUSH)
+        # Reset terminal state that claude's TUI may have left active.
+        # ?25h cursor on, ?1049l leave alt-screen, ?2004l no bracketed paste,
+        # ?1004l no focus events, 0m reset SGR.
+        sys.stdout.write("\x1b[?25h\x1b[?1049l\x1b[?2004l\x1b[?1004l\x1b[0m")
+        sys.stdout.flush()
+    except Exception:
+        pass
 
 
 # ── doc command ───────────────────────────────────────────────────────────
@@ -898,6 +1011,57 @@ def _render_params_table() -> str:
         examples = meta.get("examples", "").replace("|", r"\|")
         rows.append(f"| `{key}` | {desc} | {examples} |")
     return "\n".join(rows)
+
+
+SHELL_INIT_SNIPPET = r"""# clc shell wrapper — add to ~/.zshrc or ~/.bashrc:  eval "$(clc shell-init)"
+#
+# Wraps `clc` so that `clc sessions cd NAME` actually changes the parent
+# shell's cwd (a child process can't change its parent's cwd; only a shell
+# function can). All other invocations pass straight through to real clc.
+clc() {
+    if [[ "$1" == "sessions" && "$2" == "cd" ]]; then
+        local dir
+        dir="$(command clc sessions cd "${@:3}" 2>/dev/null)"
+        if [[ -n "$dir" && -d "$dir" ]]; then
+            builtin cd "$dir"
+            echo "-> $dir"
+        else
+            command clc sessions cd "${@:3}"
+            return 1
+        fi
+    elif [[ "$1" == "sessions" && "$2" == "resume" ]]; then
+        # Best-effort: shift the parent shell's cwd too, so when claude exits
+        # the user lands in the session's directory rather than back where they were.
+        # Identifier is the first non-flag arg after `resume`.
+        local _arg _id=""
+        for _arg in "${@:3}"; do
+            case "$_arg" in
+                -*) ;;
+                *) _id="$_arg"; break ;;
+            esac
+        done
+        if [[ -n "$_id" ]]; then
+            local dir
+            dir="$(command clc sessions cd "$_id" 2>/dev/null)"
+            if [[ -n "$dir" && -d "$dir" ]]; then
+                builtin cd "$dir"
+            fi
+        fi
+        command clc "$@"
+    else
+        command clc "$@"
+    fi
+}
+"""
+
+
+@app.command(name="shell-init")
+def shell_init():
+    """Print shell functions (clccd / clcgo) for actually changing the parent shell's cwd.
+
+    Add to ~/.zshrc or ~/.bashrc:  eval "$(clc shell-init)"
+    """
+    print(SHELL_INIT_SNIPPET)
 
 
 @app.command()
@@ -922,11 +1086,12 @@ def run(
     sandbox: Optional[int] = typer.Option(None, "--sandbox", metavar="0|1", help="Set IS_SANDBOX env var (1 = sandbox, 0 = not)."),
     user_type: Optional[str] = typer.Option(None, "--user-type", metavar="TYPE", help="Set USER_TYPE env var."),
     version: Optional[str] = typer.Option(None, "--version", "-v", metavar="VERSION", help="Pin a Claude Code release via npx (e.g. 2.1.96). Empty = local binary."),
+    resume: Optional[str] = typer.Option(None, "--resume", "-r", metavar="SESSION_ID", help="Resume a prior session by id (passed to claude as --resume)."),
     dry_run: bool = typer.Option(False, "--dry-run", "-n", help="Print the command and env that would be executed, then exit."),
     prompt: Optional[str] = typer.Argument(None, help="Prompt to send as the first message. Defaults to 'go' (which the session hook routes to TODO.md)."),
 ):
     """Launch Claude Code with optional overrides. Overrides are runtime-only; persist with `clc config set`."""
-    _run_claude(
+    code = _run_claude(
         effort=effort,
         max_tokens=_parse_tokens(max_tokens) if max_tokens else None,
         model=model,
@@ -937,7 +1102,10 @@ def run(
         version=version,
         dry_run=dry_run,
         prompt=prompt,
+        resume=resume,
     )
+    if code:
+        raise typer.Exit(code)
 
 
 # ── entrypoint ─────────────────────────────────────────────────────────────

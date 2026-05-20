@@ -7,6 +7,7 @@ requires-python = ">=3.11"
 dependencies = [
     "typer>=0.15.0",
     "rich>=13.7.1",
+    "questionary>=2.0.1",
 ]
 
 # Note: clc has no .py extension. uv warns that [project.scripts] requires
